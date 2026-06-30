@@ -140,3 +140,29 @@ No. Indexes aren't free:
 - Excess, unused indexes increase query planner complexity without improving read performance for queries that don't use them.
 
 The better approach is to index based on actual, observed query patterns (as done above for `studentID`/`isRead`/`createdAt` and `notification_type`/`created_at`), not defensively across all columns.
+
+## Stage 4: Reducing Repeated Fetch Overhead
+
+### Problem
+
+Notifications are fetched on every page load for every student, overwhelming the DB under high traffic and degrading user experience (slow loads, potential timeouts).
+
+### Recommended Strategy
+
+**1. Caching layer (Redis)**
+Cache each student's unread notification list (or count) with a short TTL (e.g., 30-60 seconds). Most page loads can be served from cache instead of hitting the DB directly.
+- *Tradeoff:* introduces slight staleness (a new notification might take up to the TTL window to appear) and adds cache invalidation complexity when a notification is marked read.
+
+**2. Push instead of poll**
+Replace "fetch on every page load" with a real-time push mechanism (WebSockets or Server-Sent Events). The client maintains a live connection and receives new notifications as they happen, rather than re-querying on each load.
+- *Tradeoff:* more complex infrastructure (persistent connections, scaling WebSocket servers), but drastically reduces redundant DB reads.
+
+**3. Client-side caching with invalidation**
+Cache the notification list in browser memory/local state once fetched, and only refetch when the user explicitly triggers an action (e.g., opens the notification panel) or receives a push signal that new data is available — instead of refetching on every navigation.
+
+**4. Pagination + lazy loading**
+Don't fetch the entire notification history at once — fetch a small page (e.g., 10-20 items) initially, loading more only as the user scrolls or requests it.
+
+### Recommended Combination
+
+For this use case, a combination of (2) push-based updates for real-time new notifications + (3) client-side caching to avoid redundant fetches gives the best balance: low latency for new alerts, minimal redundant DB load, without the staleness risk of pure server-side caching. Caching (1) can be layered in as a secondary optimization for read-heavy endpoints like "get unread count."
