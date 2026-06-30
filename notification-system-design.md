@@ -92,3 +92,51 @@ CREATE INDEX idx_type_created ON notifications (notification_type, created_at);
   - *Mitigation:* batch inserts where possible, and consider a write-behind queue (e.g., insert into a queue, async-write to DB) to smooth spikes.
 - **Index overhead:** more indexes speed reads but slow every insert/update; only the two indexes above are added, targeting actual query patterns rather than indexing every column defensively.
 - **Pagination at scale:** offset-based pagination (`LIMIT/OFFSET`) gets slower as the offset grows; cursor-based pagination (using `created_at` + `id` as a cursor) avoids this and is recommended once the table grows large.
+
+## Stage 3: Query Optimization
+
+### Original Query
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt ASC;
+```
+
+### Why This Is Slow
+
+With 50,000 students and 5,000,000 notifications, this query is slow because:
+
+- Without a composite index covering `studentID`, `isRead`, and `createdAt`, the database performs a full table scan, checking every row against the WHERE conditions.
+- Even with a single-column index on `studentID`, the database would still need to filter `isRead` and sort `createdAt` separately, adding overhead.
+- `SELECT *` retrieves all columns, including potentially large text fields (`message`), increasing I/O cost unnecessarily if only specific fields are needed.
+
+### Recommended Fix
+
+Add a composite index matching the query's filter and sort pattern:
+
+```sql
+CREATE INDEX idx_student_unread_created ON notifications (student_id, is_read, created_at);
+```
+
+This lets the database use a single index scan to filter by student and read status, and return results already sorted by `created_at`, avoiding a separate sort step.
+
+### Query for Placement Notifications in the Last 7 Days
+
+```sql
+SELECT id, student_id, message, created_at
+FROM notifications
+WHERE notification_type = 'Placement'
+  AND created_at >= NOW() - INTERVAL '7 days';
+```
+
+Backed by the existing `idx_type_created` index on `(notification_type, created_at)`, this scans only relevant rows rather than the full table.
+
+### Is "Add Indexes Everywhere" Good Advice?
+
+No. Indexes aren't free:
+
+- Every additional index slows down INSERT/UPDATE/DELETE operations, since each index must be updated alongside the data.
+- Indexes consume additional storage, which grows significantly at this scale (millions of rows).
+- Excess, unused indexes increase query planner complexity without improving read performance for queries that don't use them.
+
+The better approach is to index based on actual, observed query patterns (as done above for `studentID`/`isRead`/`createdAt` and `notification_type`/`created_at`), not defensively across all columns.
