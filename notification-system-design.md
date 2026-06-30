@@ -166,3 +166,35 @@ Don't fetch the entire notification history at once — fetch a small page (e.g.
 ### Recommended Combination
 
 For this use case, a combination of (2) push-based updates for real-time new notifications + (3) client-side caching to avoid redundant fetches gives the best balance: low latency for new alerts, minimal redundant DB load, without the staleness risk of pure server-side caching. Caching (1) can be layered in as a secondary optimization for read-heavy endpoints like "get unread count."
+
+## Stage 5: Reliable Bulk Notification Delivery
+
+### Issues With the Proposed Implementation
+- **Synchronous, sequential processing:** looping through 50,000 students one at a time, with a blocking email call each iteration, is slow and doesn't scale — a single slow or hanging email call delays every subsequent student.
+- **No fault isolation:** if `send_email` fails for one student, there's no handling shown — it's unclear whether the loop continues, retries, or aborts. The reported failure for 200 students midway suggests the whole batch wasn't resilient to partial failures.
+- **No retry mechanism:** a transient failure (network blip, rate limit from email provider) permanently loses that notification with no second attempt.
+- **Tight coupling of concerns:** email sending, DB persistence, and push notification are all bundled in one synchronous flow per student — if one step fails, it's unclear what state the other two are left in (e.g., was it saved to DB even though the email failed?).
+
+### Why It Failed for 200 Students Midway
+
+Likely causes: the email provider rate-limited or temporarily failed for a batch of requests sent in rapid succession synchronously, and since there's no retry or error handling shown, those 200 simply got skipped/lost rather than retried.
+
+### Redesigned Approach
+
+1. **Save to DB first, always** — persist all 50,000 notifications to the database immediately in a single batch insert. This is the source of truth; once saved, no notification is "lost" even if delivery (email/push) later fails.
+2. **Queue-based async delivery** — push each student's notification job onto a message queue (e.g., SQS, RabbitMQ, BullMQ) instead of looping synchronously. Worker processes consume the queue and handle email/push delivery independently and in parallel.
+3. **Retry with backoff** — each queued job gets automatic retries (e.g., 3 attempts with exponential backoff) on failure, and failed jobs after max retries go to a dead-letter queue for manual review/reprocessing rather than silently disappearing.
+4. **Decouple email and push** — these are independent delivery channels; a failure in one shouldn't block or be conflated with the other. Process them as separate queued jobs.
+
+### Should DB Save and Email Send Happen Together?
+
+No — they should be decoupled. The DB save is a low-risk, fast, reliable operation and should happen first and synchronously as a batch. Email/push delivery are slower, less reliable (third-party dependent) operations and should be handled asynchronously via the queue. Coupling them means a flaky email provider can block or corrupt the more reliable DB write, which is the core flaw in the original design.
+
+### Revised Pseudocode
+batch_save_to_db(notifications)  // single reliable batch write
+
+for student_id in student_ids:
+    enqueue_job("send_email", {student_id, message})
+    enqueue_job("push_to_app", {student_id, message})
+
+// Workers consume queue independently, with retry + dead-letter handling
